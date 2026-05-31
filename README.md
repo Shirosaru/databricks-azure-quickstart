@@ -196,277 +196,344 @@ display(df)
 
 ## 🔴 Tutorial 3 — AI/ML Model Training & Management (~30 min)
 
-> **Goal:** Train a wine quality classifier, tune it with hyperparameter optimization, register it in Unity Catalog, and deploy it as a live endpoint.
+> **Goal:** Train a classifier, tune it with hyperparameter optimization, register it in Unity Catalog, and deploy it as a live endpoint.
 >
 > **What you're learning:** scikit-learn + MLflow + Optuna + Model Serving — the full ML workflow on Databricks.
 
-### Requirements for this tutorial
+### 🧪 Choose Your Dataset
 
-- Cluster running **Databricks Runtime 17.3 LTS ML** or above
-- `USE_CATALOG` privilege on the `main` catalog
-- `USE_SCHEMA`, `CREATE_TABLE`, and `CREATE_MODEL` privileges on the `default` schema
+You have **two options** — pick whichever fits your setup:
 
-### Setup — Configure MLflow & Load Data
+| Option | Dataset | Requires Unity Catalog? | Best for |
+|---|---|---|---|
+| **Option A** | Built-in wine quality CSV (Databricks datasets) | ✅ Yes | If you have Unity Catalog enabled |
+| **Option B ⭐ Recommended for beginners** | Synthetic data generated in-memory | ❌ No | Zero setup, works anywhere, no permissions needed |
 
-**Cell 1 — Configure MLflow to use Unity Catalog:**
+---
+
+### ⭐ Option B — Synthetic Dataset (Zero Setup, Works Anywhere)
+
+> This is the fastest way to get the full ML pipeline running. No files, no catalog, no permissions needed.
+
+#### Setup — Requirements & Imports
+
+**Cell 1 — Imports and MLflow setup:**
 
 ```python
 import mlflow
-
-# Tell MLflow to store models in Unity Catalog (not the legacy workspace registry)
-mlflow.set_registry_uri("databricks-uc")
-```
-
-> 👀 **What to look for:** No output — just confirm the cell runs without errors.
-
-**Cell 2 — Set your catalog and schema:**
-
-```python
-# Change these if you're using a different catalog/schema
-CATALOG_NAME = "main"
-SCHEMA_NAME = "default"
-```
-
-**Cell 3 — Load the wine dataset and save to Unity Catalog:**
-
-```python
-# Read wine quality CSVs (built into Databricks datasets)
-white_wine = spark.read.csv("/databricks-datasets/wine-quality/winequality-white.csv", sep=';', header=True)
-red_wine = spark.read.csv("/databricks-datasets/wine-quality/winequality-red.csv", sep=';', header=True)
-
-# Clean up column names (remove spaces)
-for c in white_wine.columns:
-    white_wine = white_wine.withColumnRenamed(c, c.replace(" ", "_"))
-for c in red_wine.columns:
-    red_wine = red_wine.withColumnRenamed(c, c.replace(" ", "_"))
-
-# Save to Unity Catalog tables
-spark.sql(f"DROP TABLE IF EXISTS {CATALOG_NAME}.{SCHEMA_NAME}.white_wine")
-spark.sql(f"DROP TABLE IF EXISTS {CATALOG_NAME}.{SCHEMA_NAME}.red_wine")
-white_wine.write.saveAsTable(f"{CATALOG_NAME}.{SCHEMA_NAME}.white_wine")
-red_wine.write.saveAsTable(f"{CATALOG_NAME}.{SCHEMA_NAME}.red_wine")
-
-print("Data saved to Unity Catalog ✅")
-```
-
-> 👀 **What to look for:** `Data saved to Unity Catalog ✅` — two tables now exist in your catalog under **Data** in the sidebar.
-
-**Cell 4 — Preprocess the data:**
-
-```python
 import numpy as np
 import pandas as pd
 import sklearn.datasets
 import sklearn.metrics
 import sklearn.model_selection
 import sklearn.ensemble
+
+# Use the standard Databricks workspace model registry (no Unity Catalog needed)
+mlflow.set_registry_uri("databricks")
+```
+
+> 👀 **What to look for:** No errors. All libraries are pre-installed on Databricks ML Runtime.
+
+#### Generate a Synthetic Dataset
+
+**Cell 2 — Create fake data with scikit-learn:**
+
+```python
+# Generate a synthetic binary classification dataset — 1000 samples, 10 features
+X, y = sklearn.datasets.make_classification(
+    n_samples=1000,      # 1000 rows of data
+    n_features=10,       # 10 input features (e.g., "sensor_1" through "sensor_10")
+    n_informative=6,     # 6 features actually matter for the prediction
+    n_redundant=2,       # 2 features are noisy copies of informative ones
+    random_state=42
+)
+
+# Name the columns so they're readable
+feature_names = [f"feature_{i}" for i in range(1, 11)]
+X_df = pd.DataFrame(X, columns=feature_names)
+y_series = pd.Series(y, name="label")  # label = 0 or 1
+
+# 80/20 train-test split
+X_train, X_test, y_train, y_test = sklearn.model_selection.train_test_split(
+    X_df, y_series, test_size=0.2, random_state=42
+)
+
+print(f"✅ Dataset ready!")
+print(f"   Training samples : {len(X_train)}")
+print(f"   Test samples     : {len(X_test)}")
+print(f"   Features         : {list(X_train.columns)}")
+print(f"   Label balance    : {y_train.value_counts().to_dict()}")
+```
+
+> 👀 **What to look for:**
+> - 800 training, 200 test samples
+> - Features named `feature_1` through `feature_10`
+> - Label balance close to 50/50 (it's designed to be balanced)
+
+#### Part 1 — Train a Baseline Model
+
+**Cell 3 — Train with MLflow autologging:**
+
+```python
+mlflow.sklearn.autolog()
+
+with mlflow.start_run(run_name="synthetic_baseline") as run:
+    model = sklearn.ensemble.GradientBoostingClassifier(random_state=42)
+    model.fit(X_train, y_train)
+
+    predicted_probs = model.predict_proba(X_test)
+    roc_auc = sklearn.metrics.roc_auc_score(y_test, predicted_probs[:, 1])
+
+    # Plot and save the ROC curve
+    roc_display = sklearn.metrics.RocCurveDisplay.from_estimator(model, X_test, y_test)
+    roc_display.figure_.savefig("roc_curve.png")
+
+    mlflow.log_metric("test_auc", roc_auc)
+    mlflow.log_artifact("roc_curve.png")
+
+    print(f"✅ Baseline Test AUC: {roc_auc:.4f}")
+    print(f"   Run ID: {run.info.run_id}")
+```
+
+> 👀 **What to look for:**
+> - AUC score around 0.92–0.96 (synthetic data is cleaner than real data)
+> - Click the **Experiments** flask icon (top-right) to see this run tracked automatically
+> - MLflow auto-captured: model parameters, training metrics, the model file itself
+
+#### Part 2 — Hyperparameter Tuning
+
+**Cell 4 — Define the Optuna objective:**
+
+```python
+import optuna
+
+def objective(trial):
+    mlflow.sklearn.autolog()
+    with mlflow.start_run(nested=True):
+        params = {
+            "n_estimators":  trial.suggest_int("n_estimators", 50, 500),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.5, log=True),
+            "max_depth":     trial.suggest_int("max_depth", 2, 6),
+        }
+        clf = sklearn.ensemble.GradientBoostingClassifier(random_state=42, **params)
+        clf.fit(X_train, y_train)
+        probs = clf.predict_proba(X_test)
+        auc = sklearn.metrics.roc_auc_score(y_test, probs[:, 1])
+        mlflow.log_metric("test_auc", auc)
+        return -auc  # Optuna minimizes — negate to maximize AUC
+```
+
+**Cell 5 — Run 20 tuning trials (fast for beginners):**
+
+```python
+with mlflow.start_run(run_name="synthetic_optuna_tuning") as parent_run:
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=20)
+
+print(f"✅ Tuning complete! Best AUC: {-study.best_value:.4f}")
+print(f"   Best params: {study.best_params}")
+```
+
+> 👀 **What to look for:**
+> - 20 child runs appear nested under `synthetic_optuna_tuning` in the Experiments panel
+> - Each run has different params — Optuna is automatically searching the space
+> - Best AUC should beat your baseline
+
+**Cell 6 — Retrieve the best run from MLflow:**
+
+```python
+best_run = mlflow.search_runs(
+    order_by=["metrics.test_auc DESC", "start_time DESC"],
+    max_results=10
+).iloc[0]
+
+print("🏆 Best Tuned Model:")
+print(f"   AUC:           {best_run['metrics.test_auc']:.4f}")
+print(f"   n_estimators:  {best_run['params.n_estimators']}")
+print(f"   max_depth:     {best_run['params.max_depth']}")
+print(f"   learning_rate: {best_run['params.learning_rate']}")
+
+best_model = mlflow.pyfunc.load_model(f"runs:/{best_run.run_id}/model")
+best_preds = X_test.copy()
+best_preds["prediction"] = best_model.predict(X_test)
+display(best_preds.head(10))
+```
+
+#### Part 3 — Register the Model
+
+**Cell 7 — Register in the workspace model registry:**
+
+```python
+model_uri = f"runs:/{best_run.run_id}/model"
+model_name = "synthetic_classifier"
+
+registered = mlflow.register_model(model_uri, model_name)
+print(f"✅ Registered: {registered.name}  version {registered.version}")
+```
+
+> 👀 **What to look for:**
+> - Go to **Models** in the left sidebar — you'll see `synthetic_classifier` listed
+> - Click it to see version history and the model artifact
+
+#### Part 4 — Deploy the Model as a REST Endpoint
+
+1. Click **Serving** in the left sidebar
+2. Click **Create serving endpoint**
+3. Fill in:
+   - **Name:** `synthetic-classifier-endpoint`
+   - **Entity:** Select `synthetic_classifier` from your models
+   - **Version:** Latest
+   - **Traffic:** `100%`
+   - **Compute type:** `CPU`
+   - **Scale-out:** `Small`
+4. Click **Create**
+
+> ⏳ Wait ~5 min for status to go from **Not Ready** → **Ready** (green)
+
+5. Once ready, click **Use** and paste this test payload:
+
+```json
+{
+  "inputs": {
+    "feature_1":  [0.5],
+    "feature_2":  [-1.2],
+    "feature_3":  [0.8],
+    "feature_4":  [0.1],
+    "feature_5":  [-0.3],
+    "feature_6":  [1.1],
+    "feature_7":  [0.0],
+    "feature_8":  [-0.7],
+    "feature_9":  [0.4],
+    "feature_10": [0.9]
+  }
+}
+```
+
+> 👀 **What to look for:** A live JSON response with `predictions: [0]` or `predictions: [1]` — your model is now a live API! 🎉
+
+---
+
+### Option A — Built-in Wine Quality Dataset (Requires Unity Catalog)
+
+> Use this if your workspace has Unity Catalog enabled with `CREATE_MODEL` privileges on `main.default`.
+
+#### Setup
+
+**Cell 1 — Configure MLflow for Unity Catalog:**
+
+```python
+import mlflow
+mlflow.set_registry_uri("databricks-uc")
+
+CATALOG_NAME = "main"
+SCHEMA_NAME  = "default"
+```
+
+**Cell 2 — Load and save wine data to Unity Catalog:**
+
+```python
+white_wine = spark.read.csv("/databricks-datasets/wine-quality/winequality-white.csv", sep=';', header=True)
+red_wine   = spark.read.csv("/databricks-datasets/wine-quality/winequality-red.csv",   sep=';', header=True)
+
+for c in white_wine.columns:
+    white_wine = white_wine.withColumnRenamed(c, c.replace(" ", "_"))
+for c in red_wine.columns:
+    red_wine = red_wine.withColumnRenamed(c, c.replace(" ", "_"))
+
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG_NAME}.{SCHEMA_NAME}.white_wine")
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG_NAME}.{SCHEMA_NAME}.red_wine")
+white_wine.write.saveAsTable(f"{CATALOG_NAME}.{SCHEMA_NAME}.white_wine")
+red_wine.write.saveAsTable(f"{CATALOG_NAME}.{SCHEMA_NAME}.red_wine")
+print("✅ Wine data saved to Unity Catalog!")
+```
+
+**Cell 3 — Preprocess:**
+
+```python
+import numpy as np
+import pandas as pd
+import sklearn.datasets, sklearn.metrics, sklearn.model_selection, sklearn.ensemble
 import matplotlib.pyplot as plt
 import optuna
 from mlflow.optuna.storage import MlflowStorage
 from mlflow.pyspark.optuna.study import MlflowSparkStudy
 
-# Load from Unity Catalog into Pandas
 white_wine = spark.read.table(f"{CATALOG_NAME}.{SCHEMA_NAME}.white_wine").toPandas()
-red_wine = spark.read.table(f"{CATALOG_NAME}.{SCHEMA_NAME}.red_wine").toPandas()
+red_wine   = spark.read.table(f"{CATALOG_NAME}.{SCHEMA_NAME}.red_wine").toPandas()
 
-# Tag red vs white
 white_wine['is_red'] = 0.0
-red_wine['is_red'] = 1.0
+red_wine['is_red']   = 1.0
 data_df = pd.concat([white_wine, red_wine], axis=0)
 
-# Label: 1 = high quality (score >= 7), 0 = not high quality
 data_labels = data_df['quality'].astype('int') >= 7
 data_df = data_df.drop(['quality'], axis=1)
 
-# 80/20 train-test split
 X_train, X_test, y_train, y_test = sklearn.model_selection.train_test_split(
     data_df, data_labels, test_size=0.2, random_state=1
 )
-
-print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+print(f"Training: {len(X_train)}, Test: {len(X_test)}")
 ```
 
-> 👀 **What to look for:** Training/test counts printed. The `quality` column is gone — replaced by a binary label (`True`/`False` = high quality or not).
-
----
-
-### Part 1 — Train a Baseline Model with MLflow Tracking
-
-**Cell 5 — Enable MLflow autologging and train:**
+**Cell 4 — Train:**
 
 ```python
-# Autolog automatically captures: model params, metrics, the model artifact itself
 mlflow.sklearn.autolog()
 
 with mlflow.start_run(run_name='gradient_boost') as run:
     model = sklearn.ensemble.GradientBoostingClassifier(random_state=0)
     model.fit(X_train, y_train)
-
-    # Calculate AUC (area under ROC curve) — higher is better, max = 1.0
     predicted_probs = model.predict_proba(X_test)
     roc_auc = sklearn.metrics.roc_auc_score(y_test, predicted_probs[:,1])
-
-    # Plot and save the ROC curve
     roc_curve = sklearn.metrics.RocCurveDisplay.from_estimator(model, X_test, y_test)
     roc_curve.figure_.savefig("roc_curve.png")
-
-    # Log additional metric and artifact manually
     mlflow.log_metric("test_auc", roc_auc)
     mlflow.log_artifact("roc_curve.png")
-
-    print(f"✅ Baseline model Test AUC: {roc_auc:.4f}")
+    print(f"✅ Baseline AUC: {roc_auc:.4f}")
 ```
 
-> 👀 **What to look for:**
-> - AUC score printed (expect ~0.88–0.92 for a decent baseline)
-> - Click the **flask icon (Experiments)** in the top-right of the notebook to see your run logged in MLflow
-> - You'll see parameters (like `n_estimators`, `learning_rate`), metrics (`test_auc`), and the ROC curve image all auto-saved
-
-**Cell 6 — Load and verify the model from MLflow:**
-
-```python
-# Load the model back from MLflow — this is how you'd use it in another notebook or job
-model_loaded = mlflow.pyfunc.load_model(
-    'runs:/{run_id}/model'.format(run_id=run.info.run_id)
-)
-
-predictions_loaded = model_loaded.predict(X_test)
-predictions_original = model.predict(X_test)
-
-# Sanity check — loaded model should give identical predictions
-assert(np.array_equal(predictions_loaded, predictions_original))
-print("✅ Model loaded from MLflow and verified!")
-```
-
-> 👀 **What to look for:** `✅ Model loaded from MLflow and verified!` — this confirms the model was saved and can be retrieved.
-
----
-
-### Part 2 — Hyperparameter Tuning with Optuna
-
-Instead of guessing the best settings, Optuna automatically searches for the best combination of hyperparameters across 32 trials.
-
-**Cell 7 — Define the tuning objective:**
+**Cell 5 — Tune with Optuna (32 trials, parallel):**
 
 ```python
 def objective(trial):
     mlflow.sklearn.autolog()
     with mlflow.start_run(nested=True):
-        # Optuna suggests different values for each trial
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 20, 1000),
+            'n_estimators':  trial.suggest_int('n_estimators', 20, 1000),
             'learning_rate': trial.suggest_float('learning_rate', 0.05, 1.0, log=True),
-            'max_depth': trial.suggest_int('max_depth', 2, 5),
+            'max_depth':     trial.suggest_int('max_depth', 2, 5),
         }
-        model_hp = sklearn.ensemble.GradientBoostingClassifier(random_state=0, **params)
-        model_hp.fit(X_train, y_train)
-        predicted_probs = model_hp.predict_proba(X_test)
-        roc_auc = sklearn.metrics.roc_auc_score(y_test, predicted_probs[:,1])
-        mlflow.log_metric('test_auc', roc_auc)
-        return -roc_auc  # Optuna minimizes, so negate AUC
-```
+        m = sklearn.ensemble.GradientBoostingClassifier(random_state=0, **params)
+        m.fit(X_train, y_train)
+        auc = sklearn.metrics.roc_auc_score(y_test, m.predict_proba(X_test)[:,1])
+        mlflow.log_metric('test_auc', auc)
+        return -auc
 
-**Cell 8 — Run 32 parallel trials:**
-
-```python
 with mlflow.start_run(run_name='gb_optuna') as run:
     experiment_id = mlflow.active_run().info.experiment_id
     mlflow_storage = MlflowStorage(experiment_id=experiment_id)
-
-    # MlflowSparkStudy uses Spark workers to run trials in parallel
-    mlflow_study = MlflowSparkStudy(
-        study_name="gb-optuna-tuning",
-        storage=mlflow_storage,
-    )
+    mlflow_study = MlflowSparkStudy(study_name="gb-optuna-tuning", storage=mlflow_storage)
     mlflow_study.optimize(objective, n_trials=32, n_jobs=4)
 
-print("✅ Hyperparameter tuning complete!")
+print("✅ Tuning complete!")
 ```
 
-> ⏳ This runs 32 trials across 4 workers — takes a few minutes.  
-> 👀 **What to look for:** In the Experiments panel, you'll see 32 child runs nested under `gb_optuna`. Each shows different params and its AUC score.
-
-**Cell 9 — Find the best model:**
+**Cell 6 — Register best model to Unity Catalog:**
 
 ```python
-# Sort all runs by AUC descending to find the winner
 best_run = mlflow.search_runs(
-    order_by=['metrics.test_auc DESC', 'start_time DESC'],
-    max_results=10,
+    order_by=['metrics.test_auc DESC', 'start_time DESC'], max_results=10
 ).iloc[0]
 
-print("🏆 Best Run Results:")
-print(f"  AUC:           {best_run['metrics.test_auc']:.4f}")
-print(f"  n_estimators:  {best_run['params.n_estimators']}")
-print(f"  max_depth:     {best_run['params.max_depth']}")
-print(f"  learning_rate: {best_run['params.learning_rate']}")
+print(f"🏆 Best AUC: {best_run['metrics.test_auc']:.4f}")
 
-# Load the best model
-best_model_pyfunc = mlflow.pyfunc.load_model(
-    'runs:/{run_id}/model'.format(run_id=best_run.run_id)
-)
-
-# Generate predictions with the best model
-best_model_predictions = X_test.copy()
-best_model_predictions["prediction"] = best_model_pyfunc.predict(X_test)
-display(best_model_predictions.head(10))
-```
-
-> 👀 **What to look for:** Best AUC should be noticeably higher than your baseline (~0.90+). The printed params show the winning hyperparameter combo.
-
----
-
-### Part 3 — Save Results & Register Model in Unity Catalog
-
-**Cell 10 — Save predictions table:**
-
-```python
-predictions_table = f"{CATALOG_NAME}.{SCHEMA_NAME}.predictions"
-spark.sql(f"DROP TABLE IF EXISTS {predictions_table}")
-
-results = spark.createDataFrame(best_model_predictions)
-results.write.saveAsTable(predictions_table)
-
-print(f"✅ Predictions saved to {predictions_table}")
-```
-
-**Cell 11 — Register the model:**
-
-```python
-model_uri = 'runs:/{run_id}/model'.format(run_id=best_run.run_id)
-
-registered_model = mlflow.register_model(
-    model_uri,
+mlflow.register_model(
+    f"runs:/{best_run.run_id}/model",
     f"{CATALOG_NAME}.{SCHEMA_NAME}.wine_quality_model"
 )
-
-print(f"✅ Model registered: {registered_model.name} version {registered_model.version}")
+print("✅ Model registered in Unity Catalog!")
 ```
 
-> 👀 **What to look for:**
-> - Go to **Data → main → default** in the sidebar and you'll see `wine_quality_model` listed as a registered model
-> - You can click it to see version history, lineage, and metadata
-
----
-
-### Part 4 — Deploy the Model as a REST Endpoint
-
-**This is the "management" part — your model is now live and callable via API.**
-
-1. Click **Serving** in the left sidebar
-2. Click **Create serving endpoint**
-3. Fill in the form:
-   - **Name:** `wine-quality-endpoint` (or any name)
-   - **Entity:** Click the field → Select **My models - Unity Catalog** → choose `wine_quality_model`
-   - **Version:** Pick the latest version
-   - **Traffic:** Set to `100%`
-   - **Compute type:** `CPU`
-   - **Scale-out size:** `Small`
-4. Click **Create**
-
-> ⏳ The endpoint status shows **Not Ready** for a few minutes while it initializes.
-
-> 👀 **What to look for:** Once the status turns **Ready** (green), click **Use** to send a test inference request. You'll get a live API response with wine quality predictions!
+**Deploy:** Follow the same Serving steps as Option B above, selecting `wine_quality_model` instead.
 
 ---
 
@@ -476,13 +543,14 @@ print(f"✅ Model registered: {registered_model.name} version {registered_model.
 |---|---|
 | "No cluster attached" | Go to **Compute → Create Compute** first |
 | Notebook won't run | Make sure cluster shows a **green dot** (Running) |
-| Permission errors | Ask Azure admin — Unity Catalog `CREATE_MODEL` privileges needed |
+| Permission errors on Unity Catalog | Use **Option B** (synthetic) — no catalog permissions needed |
 | Slow first run | Cluster startup takes ~2–5 min — totally normal |
 | Cell stuck running | Click **Interrupt** and check cluster status |
-| `table not found` error | Make sure Unity Catalog is enabled in your workspace |
+| `table not found` error | Switch to Option B, or ask admin to enable Unity Catalog |
 | MLflow runs not appearing | Click the 🔄 refresh icon on the Experiments panel |
-| Optuna tuning is slow | Reduce `n_trials` from 32 to 8 for a faster test run |
+| Optuna tuning is slow | Reduce `n_trials` to 8–10 for a faster test run |
 | Serving endpoint stuck "Not Ready" | Wait 5+ minutes; check cluster logs if still stuck |
+| Serving test payload errors | Make sure feature names in JSON match your training data exactly |
 
 ---
 
@@ -490,9 +558,10 @@ print(f"✅ Model registered: {registered_model.name} version {registered_model.
 
 1. ✅ **Tutorial 1** — Query & visualize (get comfortable with notebooks)
 2. ✅ **Tutorial 2** — ETL pipeline with Auto Loader + Delta Lake
-3. ✅ **Tutorial 3** — Train, tune, register, and deploy an ML model
-4. 🔜 **Workflows** — Schedule notebooks as automated jobs
-5. 🔜 **Lakeflow Declarative Pipelines** — Declarative ETL with less code
+3. ✅ **Tutorial 3 Option B** — Synthetic ML pipeline (fastest path to deployment)
+4. ✅ **Tutorial 3 Option A** — Wine quality dataset (real data with Unity Catalog)
+5. 🔜 **Workflows** — Schedule notebooks as automated jobs
+6. 🔜 **Lakeflow Declarative Pipelines** — Declarative ETL with less code
 
 ---
 
@@ -507,8 +576,9 @@ print(f"✅ Model registered: {registered_model.name} version {registered_model.
 | **Unity Catalog** | Centralized data governance — manages tables, models, permissions |
 | **MLflow** | Open-source tool for tracking ML experiments, models, and deployments |
 | **Optuna** | Hyperparameter tuning library — finds the best model settings automatically |
-| **AUC** | Area Under the Curve — ML metric for classification quality (0.5 = random, 1.0 = perfect) |
+| **AUC** | Area Under the Curve — ML metric for classification (0.5 = random, 1.0 = perfect) |
 | **Model Serving** | Deploy a registered model as a live REST API endpoint |
+| **Synthetic Dataset** | Fake data generated by code — great for testing pipelines without real data |
 
 ---
 
